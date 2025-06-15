@@ -1,0 +1,10 @@
+agents:
+  default:
+    max_concurrent_tasks: 10
+    heartbeat_interval: 30
+    task_timeout: 300
+
+security:
+  message_signing_required: true
+  rate_limit_per_agent: 100
+  rate_limit_window: 60

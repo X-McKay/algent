@@ -1,0 +1,222 @@
+# MCP Server Dockerfile with Ubuntu 24.04, Python 3.13.5, and uv
+FROM ubuntu:24.04 AS base
+
+ARG PYTHON_VERSION=3.13.5
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+
+# Install system dependencies including PostgreSQL client
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    software-properties-common \
+    libssl-dev \
+    libffi-dev \
+    libbz2-dev \
+    libreadline-dev \
+    libsqlite3-dev \
+    libpq-dev \
+    curl \
+    wget \
+    netcat-openbsd \
+    git \
+    ca-certificates \
+    postgresql-client \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Python 3.13.5
+WORKDIR /tmp
+RUN wget https://www.python.org/ftp/python/${PYTHON_VERSION}/Python-${PYTHON_VERSION}.tgz \
+    && tar xzf Python-${PYTHON_VERSION}.tgz \
+    && cd Python-${PYTHON_VERSION} \
+    && ./configure --enable-optimizations --enable-shared --with-lto \
+    && make -j$(nproc) \
+    && make altinstall \
+    && ldconfig \
+    && cd / \
+    && rm -rf /tmp/Python-${PYTHON_VERSION}*
+
+RUN ln -sf /usr/local/bin/python3.13 /usr/local/bin/python3 \
+    && ln -sf /usr/local/bin/python3.13 /usr/local/bin/python \
+    && ln -sf /usr/local/bin/pip3.13 /usr/local/bin/pip3
+
+# Install uv
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+ENV PATH="/root/.cargo/bin:$PATH"
+
+# Builder stage
+FROM base AS builder
+WORKDIR /app
+COPY pyproject.toml requirements.txt ./
+RUN uv venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+RUN uv pip install -r requirements.txt
+
+# Production stage
+FROM base AS production
+
+RUN groupadd -r agentic && useradd -r -g agentic agentic
+
+COPY --from=builder /opt/venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+WORKDIR /app
+COPY --chown=agentic:agentic src/ ./src/
+COPY --chown=agentic:agentic config/ ./config/
+COPY --chown=agentic:agentic pyproject.toml .
+
+RUN mkdir -p /app/logs /app/data && chown -R agentic:agentic /app
+
+# Enhanced MCP server placeholder
+RUN cat > /app/mcp_server.py << 'SCRIPT'
+#!/usr/bin/env python3
+"""
+Enhanced MCP Server Placeholder with health checks and basic functionality
+"""
+import asyncio
+import os
+from datetime import datetime
+from typing import Dict, Any, List
+
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+import uvicorn
+
+app = FastAPI(
+    title="MCP Server",
+    description="Model Context Protocol Server for Agentic System",
+    version="1.0.0"
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# In-memory storage for demo
+contexts: Dict[str, Dict[str, Any]] = {}
+resources: List[Dict[str, Any]] = [
+    {
+        "uri": "memory://agent_memory",
+        "name": "agent_memory",
+        "description": "Agent memory storage",
+        "mimeType": "application/json"
+    }
+]
+
+tools: List[Dict[str, Any]] = [
+    {
+        "name": "echo",
+        "description": "Echo text back",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string", "description": "Text to echo"}
+            },
+            "required": ["text"]
+        }
+    }
+]
+
+@app.get("/health")
+async def health():
+    return {
+        "status": "healthy",
+        "service": "mcp-server",
+        "version": "1.0.0",
+        "timestamp": datetime.utcnow().isoformat()
+    }
+
+@app.get("/resources")
+async def list_resources():
+    return {"resources": resources}
+
+@app.get("/tools")
+async def list_tools():
+    return {"tools": tools}
+
+@app.get("/prompts")
+async def list_prompts():
+    return {"prompts": []}
+
+@app.get("/context")
+async def get_context(context_id: str):
+    if context_id not in contexts:
+        contexts[context_id] = {
+            "context_id": context_id,
+            "resources": resources[:1],
+            "tools": tools,
+            "conversation_history": [],
+            "created_at": datetime.utcnow().isoformat()
+        }
+    return contexts[context_id]
+
+@app.post("/context")
+async def update_context(context_id: str, context_data: Dict[str, Any]):
+    contexts[context_id] = context_data
+    contexts[context_id]["updated_at"] = datetime.utcnow().isoformat()
+    return {"status": "updated", "context_id": context_id}
+
+@app.post("/tools/call")
+async def call_tool(tool_request: Dict[str, Any]):
+    tool_name = tool_request.get("name")
+    arguments = tool_request.get("arguments", {})
+    
+    if tool_name == "echo":
+        return {"result": arguments.get("text", "")}
+    else:
+        raise HTTPException(status_code=404, detail=f"Tool {tool_name} not found")
+
+if __name__ == "__main__":
+    port = int(os.getenv("MCP_PORT", 8080))
+    host = os.getenv("MCP_HOST", "0.0.0.0")
+    
+    print(f"🚀 Starting MCP Server on {host}:{port}")
+    
+    uvicorn.run(
+        app,
+        host=host,
+        port=port,
+        log_level="info",
+        access_log=True
+    )
+SCRIPT
+
+RUN cat > /app/start_mcp.sh << 'SCRIPT'
+#!/bin/bash
+set -e
+
+echo "📡 Starting MCP Server"
+echo "🐍 Python version: $(python3 --version)"
+
+# Wait for PostgreSQL
+echo "⏳ Waiting for PostgreSQL..."
+while ! nc -z postgres 5432; do sleep 1; done
+echo "✅ PostgreSQL is ready"
+
+# Wait for Redis
+echo "⏳ Waiting for Redis..."
+while ! nc -z redis 6379; do sleep 1; done
+echo "✅ Redis is ready"
+
+exec python3 /app/mcp_server.py
+SCRIPT
+
+RUN chmod +x /app/mcp_server.py /app/start_mcp.sh && \
+    chown agentic:agentic /app/mcp_server.py /app/start_mcp.sh
+
+USER agentic
+
+ENV PYTHONPATH=/app \
+    MCP_HOST=0.0.0.0 \
+    MCP_PORT=8080
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
+    CMD curl -f http://localhost:8080/health || exit 1
+
+EXPOSE 8080
+
+CMD ["/app/start_mcp.sh"]

@@ -1,0 +1,66 @@
+version: '3.8'
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: algent-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - agentic-network
+
+  postgres:
+    image: postgres:15-alpine
+    container_name: algent-postgres
+    environment:
+      POSTGRES_DB: agentic
+      POSTGRES_USER: agentic
+      POSTGRES_PASSWORD: agentic123
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agentic"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - agentic-network
+
+  agent-runner:
+    build: .
+    container_name: algent-system
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - POSTGRES_URL=postgresql://agentic:agentic123@postgres:5432/agentic
+      - LOG_LEVEL=INFO
+    ports:
+      - "8000:8000"
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./config:/app/config:ro
+      - agent_logs:/app/logs
+    networks:
+      - agentic-network
+
+volumes:
+  redis_data:
+  postgres_data:
+  agent_logs:
+
+networks:
+  agentic-network:
+    driver: bridge

@@ -1,0 +1,114 @@
+# API Server Dockerfile with Ubuntu 24.04, Python 3.13.5, and uv
+FROM ubuntu:24.04 AS base
+
+ARG PYTHON_VERSION=3.13.5
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    software-properties-common \
+    libssl-dev \
+    libffi-dev \
+    libbz2-dev \
+    libreadline-dev \
+    libsqlite3-dev \
+    curl \
+    wget \
+    netcat-openbsd \
+    git \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Python 3.13.5 from source
+WORKDIR /tmp
+RUN wget https://www.python.org/ftp/python/${PYTHON_VERSION}/Python-${PYTHON_VERSION}.tgz \
+    && tar xzf Python-${PYTHON_VERSION}.tgz \
+    && cd Python-${PYTHON_VERSION} \
+    && ./configure \
+        --enable-optimizations \
+        --enable-shared \
+        --with-lto \
+        --with-computed-gotos \
+        --with-system-ffi \
+    && make -j$(nproc) \
+    && make altinstall \
+    && ldconfig \
+    && cd / \
+    && rm -rf /tmp/Python-${PYTHON_VERSION}*
+
+# Create symlinks
+RUN ln -sf /usr/local/bin/python3.13 /usr/local/bin/python3 \
+    && ln -sf /usr/local/bin/python3.13 /usr/local/bin/python \
+    && ln -sf /usr/local/bin/pip3.13 /usr/local/bin/pip3 \
+    && ln -sf /usr/local/bin/pip3.13 /usr/local/bin/pip
+
+# Install uv
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+ENV PATH="/root/.cargo/bin:$PATH"
+
+# Builder stage
+FROM base AS builder
+
+WORKDIR /app
+COPY pyproject.toml requirements.txt ./
+RUN uv venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+RUN uv pip install -r requirements.txt
+
+# Production stage
+FROM base AS production
+
+# Create non-root user
+RUN groupadd -r agentic && useradd -r -g agentic agentic
+
+# Copy virtual environment
+COPY --from=builder /opt/venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+WORKDIR /app
+
+# Copy application code
+COPY --chown=agentic:agentic src/ ./src/
+COPY --chown=agentic:agentic examples/ ./examples/
+COPY --chown=agentic:agentic api_server.py .
+COPY --chown=agentic:agentic config/ ./config/
+COPY --chown=agentic:agentic pyproject.toml .
+
+# Create directories
+RUN mkdir -p /app/logs /app/data /app/uploads && \
+    chown -R agentic:agentic /app
+
+# Create startup script using cat with EOF
+RUN cat > /app/start_api.sh << 'SCRIPT'
+#!/bin/bash
+set -e
+
+echo "🌐 Starting Agentic API Server"
+echo "🐍 Python version: $(python3 --version)"
+
+# Wait for Redis
+echo "⏳ Waiting for Redis..."
+while ! nc -z redis 6379; do sleep 1; done
+echo "✅ Redis is ready"
+
+# Start API server
+exec python3 api_server.py
+SCRIPT
+
+RUN chmod +x /app/start_api.sh && chown agentic:agentic /app/start_api.sh
+
+USER agentic
+
+ENV PYTHONPATH=/app \
+    API_HOST=0.0.0.0 \
+    API_PORT=8000
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
+    CMD curl -f http://localhost:8000/health || exit 1
+
+EXPOSE 8000
+
+CMD ["/app/start_api.sh"]
