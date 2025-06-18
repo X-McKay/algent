@@ -3,7 +3,6 @@
 Agentic System CLI - Beautiful command-line interface for managing the agentic system
 Built with Typer for modern Python CLI development
 """
-
 import asyncio
 import json
 import os
@@ -14,7 +13,6 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from enum import Enum
-
 import typer
 import httpx
 from rich.console import Console
@@ -105,21 +103,22 @@ class AgenticConfig:
 # Global config instance
 config = AgenticConfig()
 
-class DockerManager:
-    """Docker operations manager"""
+class EarthlyManager:
+    """Earthly and Docker Compose operations manager"""
     
     def __init__(self):
-        self.compose_file = Path("docker-compose.yml")
+        self.earthfile = Path("Earthfile")
+        self.compose_file = Path("docker-compose-earthly.yml")
     
-    def check_docker(self) -> bool:
-        """Check if Docker is available and running"""
+    def check_earthly(self) -> bool:
+        """Check if Earthly is available"""
         try:
-            subprocess.run(["docker", "info"], capture_output=True, check=True)
+            subprocess.run(["earthly", "--version"], capture_output=True, check=True)
             return True
         except (subprocess.CalledProcessError, FileNotFoundError):
             return False
     
-    def check_compose(self) -> bool:
+    def check_docker_compose(self) -> bool:
         """Check if docker-compose is available"""
         try:
             subprocess.run(["docker-compose", "--version"], capture_output=True, check=True)
@@ -127,19 +126,107 @@ class DockerManager:
         except (subprocess.CalledProcessError, FileNotFoundError):
             return False
     
-    def run_compose_command(self, command: List[str], capture_output: bool = False) -> subprocess.CompletedProcess:
-        """Run a docker-compose command"""
-        cmd = ["docker-compose"] + command
+    def run_earthly_command(self, command: List[str], capture_output: bool = False) -> subprocess.CompletedProcess:
+        """Run an Earthly command"""
+        cmd = ["earthly"] + command
         if capture_output:
             return subprocess.run(cmd, capture_output=True, text=True)
         else:
             return subprocess.run(cmd)
     
+    def run_compose_command(self, command: List[str], capture_output: bool = False, use_earthly_compose: bool = True) -> subprocess.CompletedProcess:
+        """Run a docker-compose command"""
+        compose_file = "docker-compose-earthly.yml" if use_earthly_compose else "docker-compose.yml"
+        cmd = ["docker-compose", "-f", compose_file, "--env-file", ".env"] + command
+        if capture_output:
+            return subprocess.run(cmd, capture_output=True, text=True)
+        else:
+            return subprocess.run(cmd)
+    
+    def build_images(self, clean: bool = False, no_cache: bool = False) -> bool:
+        """Build images using Earthly"""
+        if not self.check_earthly():
+            return False
+        
+        if clean:
+            subprocess.run(["docker", "system", "prune", "-f"], capture_output=True)
+        
+        build_cmd = ["+all"]
+        if no_cache:
+            build_cmd.append("--no-cache")
+        
+        result = self.run_earthly_command(build_cmd)
+        return result.returncode == 0
+    
+    def start_infrastructure(self) -> bool:
+        """Start infrastructure services (redis, postgres)"""
+        if not self.check_docker_compose():
+            return False
+        
+        result = self.run_compose_command(["up", "-d", "redis", "postgres"], use_earthly_compose=True)
+        return result.returncode == 0
+    
+    def start_services(self) -> bool:
+        """Start application services"""
+        if not self.check_docker_compose():
+            return False
+        
+        result = self.run_compose_command(["up", "-d", "api-server", "file-processor", "agent-runner"], use_earthly_compose=True)
+        return result.returncode == 0
+    
+    def stop_all(self, remove_volumes: bool = False) -> bool:
+        """Stop all services"""
+        if not self.check_docker_compose():
+            return False
+        
+        cmd = ["down"]
+        if remove_volumes:
+            cmd.append("-v")
+        
+        result = self.run_compose_command(cmd, use_earthly_compose=True)
+        return result.returncode == 0
+    
+    def restart_services(self, service: Optional[str] = None) -> bool:
+        """Restart services"""
+        if not self.check_docker_compose():
+            return False
+        
+        cmd = ["restart"]
+        if service:
+            cmd.append(service)
+        
+        result = self.run_compose_command(cmd, use_earthly_compose=True)
+        return result.returncode == 0
+    
+    def get_logs(self, service: Optional[str] = None, follow: bool = False, tail: int = 100) -> bool:
+        """Get service logs"""
+        if not self.check_docker_compose():
+            return False
+        
+        cmd = ["logs"]
+        if follow:
+            cmd.append("-f")
+        if tail:
+            cmd.extend(["--tail", str(tail)])
+        if service:
+            cmd.append(service)
+        
+        result = self.run_compose_command(cmd, use_earthly_compose=True)
+        return result.returncode == 0
+    
+    def open_shell(self, service: str = "api-server") -> bool:
+        """Open shell in service container"""
+        if not self.check_docker_compose():
+            return False
+        
+        result = self.run_compose_command(["exec", service, "/bin/bash"], use_earthly_compose=True)
+        return result.returncode == 0
+    
     def get_service_status(self) -> List[Dict[str, str]]:
         """Get status of all services"""
         try:
-            result = self.run_compose_command(["ps", "--format", "json"], capture_output=True)
-            if result.returncode == 0:
+            result = self.run_compose_command(["ps", "--format", "json"], capture_output=True, use_earthly_compose=True)
+            if result.returncode == 0 and result.stdout.strip():
                 services = []
                 for line in result.stdout.strip().split('\n'):
                     if line.strip():
@@ -148,7 +235,7 @@ class DockerManager:
                             services.append({
                                 "name": service_data.get("Service", "unknown"),
                                 "state": service_data.get("State", "unknown"),
-                                "status": service_data.get("Status", "unknown"),
+                                "status": f"{service_data.get('Status', 'unknown')} ({service_data.get('Health', 'no health check')})",
                                 "ports": service_data.get("Publishers", [])
                             })
                         except json.JSONDecodeError:
@@ -156,7 +243,33 @@ class DockerManager:
                 return services
         except Exception:
             pass
+        
+        # Fallback to regular docker ps
+        try:
+            result = subprocess.run(["docker", "ps", "--format", "json", "--filter", "name=algent-"], 
+                                  capture_output=True, text=True)
+            if result.returncode == 0:
+                services = []
+                for line in result.stdout.strip().split('\n'):
+                    if line.strip():
+                        try:
+                            container_data = json.loads(line)
+                            services.append({
+                                "name": container_data.get("Names", "unknown").replace('algent-', ''),
+                                "state": "running" if container_data.get("State") == "running" else "stopped",
+                                "status": container_data.get("Status", "unknown"),
+                                "ports": container_data.get("Ports", "")
+                            })
+                        except json.JSONDecodeError:
+                            continue
+                return services
+        except Exception:
+            pass
+        
         return []
+
+# Replace DockerManager with EarthlyManager in the code
+docker_mgr = EarthlyManager()
 
 class ApiClient:
     """HTTP client for API interactions"""
@@ -197,6 +310,9 @@ class ApiClient:
         except Exception:
             return False
 
+# Global API client instance
+api = ApiClient()
+
 def show_dashboard():
     """Show the main dashboard"""
     console.clear()
@@ -209,7 +325,7 @@ def show_dashboard():
     ))
     
     # Quick status
-    docker_mgr = DockerManager()
+    docker_mgr = EarthlyManager()
     services = docker_mgr.get_service_status()
     
     if services:
@@ -253,7 +369,7 @@ def main(
         console.print(Panel.fit(
             "[bold blue]Agentic System CLI[/bold blue]\n"
             "Version: 1.0.0\n"
-            "Python: 3.13.5 • Ubuntu: 24.04 • UV: Latest\n"
+            "Python: 3.13.5 • Ubuntu: 24.04 • Earthly: Latest\n"
             "Built with ❤️  for the AI agent community",
             title="🤖 Version Info"
         ))
@@ -272,17 +388,18 @@ def docker_build(
     parallel: bool = typer.Option(True, "--parallel/--no-parallel", help="Build in parallel"),
     no_cache: bool = typer.Option(False, "--no-cache", help="Build without cache")
 ):
-    """🏗️ Build all Docker images"""
-    docker_mgr = DockerManager()
+    """🏗️ Build all Earthly targets"""
+    docker_mgr = EarthlyManager()
     
-    if not docker_mgr.check_docker():
-        console.print("[red]❌ Docker is not available or not running[/red]")
+    if not docker_mgr.check_earthly():
+        console.print("[red]❌ Earthly is not available. Please install Earthly first.[/red]")
+        console.print("[blue]💡 Visit: https://earthly.dev/get-earthly[/blue]")
         raise typer.Exit(1)
     
     console.print(Panel.fit(
         "[bold blue]🏗️ Building Agentic System Images[/bold blue]\n"
-        "Ubuntu 24.04 • Python 3.13.5 • UV Package Manager",
-        title="🐳 Docker Build"
+        "Ubuntu 24.04 • Python 3.13.5 • Optimized Dependencies",
+        title="🌍 Earthly Build"
     ))
     
     with Progress(
@@ -293,31 +410,13 @@ def docker_build(
         console=console
     ) as progress:
         
-        if clean:
-            task = progress.add_task("🧹 Cleaning old images...", total=100)
-            docker_mgr.run_compose_command(["down", "--rmi", "all", "--remove-orphans"])
-            progress.update(task, completed=100)
-        
-        # Build command
-        build_cmd = ["build"]
-        if parallel:
-            build_cmd.append("--parallel")
-        if no_cache:
-            build_cmd.append("--no-cache")
-        
-        build_cmd.extend([
-            "--build-arg", f"BUILD_DATE={datetime.utcnow().isoformat()}",
-            "--build-arg", "VERSION=1.0.0",
-            "--build-arg", "PYTHON_VERSION=3.13.5"
-        ])
-        
         task = progress.add_task("🔨 Building images...", total=100)
         
         try:
-            result = docker_mgr.run_compose_command(build_cmd)
+            success = docker_mgr.build_images(clean=clean, no_cache=no_cache)
             progress.update(task, completed=100)
             
-            if result.returncode == 0:
+            if success:
                 console.print("[green]✅ Build completed successfully![/green]")
             else:
                 console.print("[red]❌ Build failed![/red]")
@@ -329,19 +428,20 @@ def docker_build(
 @docker_app.command("start")
 def docker_start(
     detach: bool = typer.Option(True, "-d", "--detach", help="Run in detached mode"),
-    build: bool = typer.Option(False, "--build", help="Build images before starting")
+    build: bool = typer.Option(False, "--build", help="Build images before starting"),
+    infrastructure_only: bool = typer.Option(False, "--infra-only", help="Start only infrastructure services")
 ):
     """🚀 Start all services"""
-    docker_mgr = DockerManager()
+    docker_mgr = EarthlyManager()
     
-    if not docker_mgr.check_docker():
-        console.print("[red]❌ Docker is not available or not running[/red]")
+    if not docker_mgr.check_earthly() or not docker_mgr.check_docker_compose():
+        console.print("[red]❌ Earthly and docker-compose are required[/red]")
         raise typer.Exit(1)
     
     console.print(Panel.fit(
         "[bold green]🚀 Starting Agentic System[/bold green]\n"
         "Initializing agents, message bus, and API services...",
-        title="🐳 Service Startup"
+        title="🌍 Service Startup"
     ))
     
     with Progress(
@@ -352,55 +452,67 @@ def docker_start(
         
         if build:
             task = progress.add_task("🔨 Building images...", total=None)
-            docker_mgr.run_compose_command(["build"])
+            if not docker_mgr.build_images():
+                console.print("[red]❌ Failed to build images[/red]")
+                raise typer.Exit(1)
             progress.remove_task(task)
         
-        task1 = progress.add_task("🚀 Starting infrastructure...", total=None)
-        docker_mgr.run_compose_command(["up", "-d", "redis", "postgres"])
+        task1 = progress.add_task("🚀 Starting infrastructure (Redis, PostgreSQL)...", total=None)
+        if not docker_mgr.start_infrastructure():
+            console.print("[red]❌ Failed to start infrastructure[/red]")
+            raise typer.Exit(1)
         progress.remove_task(task1)
         
-        task2 = progress.add_task("⏳ Waiting for infrastructure...", total=None)
-        time.sleep(10)
-        progress.remove_task(task2)
-        
-        task3 = progress.add_task("🤖 Starting application services...", total=None)
-        cmd = ["up"]
-        if detach:
-            cmd.append("-d")
-        docker_mgr.run_compose_command(cmd)
-        progress.remove_task(task3)
-        
-        task4 = progress.add_task("🔍 Health checking...", total=None)
-        time.sleep(15)
-        progress.remove_task(task4)
+        if not infrastructure_only:
+            task2 = progress.add_task("⏳ Waiting for infrastructure...", total=None)
+            time.sleep(10)
+            progress.remove_task(task2)
+            
+            task3 = progress.add_task("🤖 Starting application services...", total=None)
+            if not docker_mgr.start_services():
+                console.print("[red]❌ Failed to start application services[/red]")
+                raise typer.Exit(1)
+            progress.remove_task(task3)
+            
+            task4 = progress.add_task("🔍 Health checking...", total=None)
+            time.sleep(15)
+            progress.remove_task(task4)
     
-    console.print("[green]✅ All services started![/green]")
-    
-    # Show access information
-    console.print(Panel.fit(
-        "[bold]🌐 Access Points:[/bold]\n"
-        "• API Server: http://localhost:8000\n"
-        "• Grafana: http://localhost:3000 (admin/admin123)\n"
-        "• Prometheus: http://localhost:9090\n"
-        "• Redis Commander: http://localhost:8081",
-        title="🔗 Quick Access"
-    ))
+    if infrastructure_only:
+        console.print("[green]✅ Infrastructure services started![/green]")
+    else:
+        console.print("[green]✅ All services started![/green]")
+        
+        # Show access information
+        console.print(Panel.fit(
+            "[bold]🌐 Access Points:[/bold]\n"
+            "• API Server: http://localhost:8000\n"
+            "• API Documentation: http://localhost:8000/docs\n"
+            "• Health Check: http://localhost:8000/health\n"
+            "• PostgreSQL: localhost:5432\n"
+            "• Redis: localhost:6379",
+            title="🔗 Quick Access"
+        ))
 
 @docker_app.command("stop")
 def docker_stop(
     volumes: bool = typer.Option(False, "-v", "--volumes", help="Remove volumes as well")
 ):
     """🛑 Stop all services"""
-    docker_mgr = DockerManager()
+    docker_mgr = EarthlyManager()
     
-    cmd = ["down"]
-    if volumes:
-        cmd.append("-v")
+    if not docker_mgr.check_docker_compose():
+        console.print("[red]❌ docker-compose is not available[/red]")
+        raise typer.Exit(1)
     
     with console.status("[bold red]Stopping services..."):
-        docker_mgr.run_compose_command(cmd)
+        success = docker_mgr.stop_all(remove_volumes=volumes)
     
-    console.print("[yellow]🛑 All services stopped[/yellow]")
+    if success:
+        console.print("[yellow]🛑 All services stopped[/yellow]")
+    else:
+        console.print("[red]❌ Failed to stop services[/red]")
+        raise typer.Exit(1)
 
 @docker_app.command("logs")
 def docker_logs(
@@ -409,25 +521,24 @@ def docker_logs(
     tail: int = typer.Option(100, "--tail", help="Number of lines to show")
 ):
     """📋 View service logs"""
-    docker_mgr = DockerManager()
+    docker_mgr = EarthlyManager()
     
-    cmd = ["logs", f"--tail={tail}"]
-    if follow:
-        cmd.append("-f")
-    if service:
-        cmd.append(service)
+    if not docker_mgr.check_docker_compose():
+        console.print("[red]❌ docker-compose is not available[/red]")
+        raise typer.Exit(1)
     
     console.print(f"[blue]📋 Viewing logs{' for ' + service if service else ''}...[/blue]")
-    docker_mgr.run_compose_command(cmd)
+    docker_mgr.get_logs(service=service, follow=follow, tail=tail)
 
 @docker_app.command("status")
 def docker_status():
     """📊 Show detailed service status"""
-    docker_mgr = DockerManager()
+    docker_mgr = EarthlyManager()
     services = docker_mgr.get_service_status()
     
     if not services:
         console.print("[yellow]No services running[/yellow]")
+        console.print("[blue]💡 Run 'agentic start' to start services[/blue]")
         return
     
     table = Table(title="📊 Detailed Service Status", show_header=True, header_style="bold magenta")
@@ -438,7 +549,7 @@ def docker_status():
     
     for service in services:
         state_color = "green" if service["state"] == "running" else "red"
-        ports = ", ".join([f"{p.get('PublishedPort', '')}" for p in service.get("ports", [])]) or "None"
+        ports = str(service.get("ports", ""))[:20] if service.get("ports") else "None"
         
         table.add_row(
             service["name"],
@@ -454,16 +565,38 @@ def docker_restart(
     service: Optional[str] = typer.Argument(None, help="Service to restart (all if not specified)")
 ):
     """🔄 Restart services"""
-    docker_mgr = DockerManager()
+    docker_mgr = EarthlyManager()
     
-    cmd = ["restart"]
-    if service:
-        cmd.append(service)
+    if not docker_mgr.check_docker_compose():
+        console.print("[red]❌ docker-compose is not available[/red]")
+        raise typer.Exit(1)
     
     with console.status(f"[bold yellow]Restarting {service or 'all services'}..."):
-        docker_mgr.run_compose_command(cmd)
+        success = docker_mgr.restart_services(service=service)
     
-    console.print(f"[green]✅ {service or 'All services'} restarted![/green]")
+    if success:
+        console.print(f"[green]✅ {service or 'All services'} restarted![/green]")
+    else:
+        console.print(f"[red]❌ Failed to restart {service or 'services'}[/red]")
+        raise typer.Exit(1)
+
+@docker_app.command("shell")
+def docker_shell(
+    service: str = typer.Argument("api-server", help="Service to open shell in")
+):
+    """🐚 Open interactive shell in a service container"""
+    docker_mgr = EarthlyManager()
+    
+    if not docker_mgr.check_docker_compose():
+        console.print("[red]❌ docker-compose is not available[/red]")
+        raise typer.Exit(1)
+    
+    console.print(f"[blue]🐚 Opening shell in {service}...[/blue]")
+    
+    try:
+        docker_mgr.open_shell(service)
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Shell session ended[/yellow]")
 
 # Agents commands group
 agents_app = typer.Typer(name="agents", help="🤖 Agent management and interaction")
@@ -882,7 +1015,7 @@ def test():
             
             # Test 4: Docker services
             task = progress.add_task("🐳 Testing Docker services...", total=None)
-            docker_mgr = DockerManager()
+            docker_mgr = EarthlyManager()
             services = docker_mgr.get_service_status()
             running_services = [s for s in services if s["state"] == "running"]
             if len(running_services) >= 3:  # At least redis, postgres, api-server
@@ -989,16 +1122,16 @@ def shell(
     service: str = typer.Argument("api-server", help="Service to open shell in")
 ):
     """🐚 Open interactive shell in a service container"""
-    docker_mgr = DockerManager()
+    docker_mgr = EarthlyManager()
     
-    if not docker_mgr.check_docker():
-        console.print("[red]❌ Docker is not available or not running[/red]")
+    if not docker_mgr.check_docker_compose():
+        console.print("[red]❌ docker-compose is not available[/red]")
         raise typer.Exit(1)
     
     console.print(f"[blue]🐚 Opening shell in {service}...[/blue]")
     
     try:
-        subprocess.run(["docker-compose", "exec", service, "/bin/bash"], check=False)
+        docker_mgr.open_shell(service)
     except KeyboardInterrupt:
         console.print("\n[yellow]Shell session ended[/yellow]")
 
@@ -1031,7 +1164,7 @@ def clean(
                 console.print("[yellow]Cleanup cancelled[/yellow]")
                 return
     
-    docker_mgr = DockerManager()
+    docker_mgr = EarthlyManager()
     
     with Progress(
         SpinnerColumn(),
@@ -1042,9 +1175,9 @@ def clean(
         # Stop services
         task = progress.add_task("🛑 Stopping services...", total=None)
         if all_data:
-            docker_mgr.run_compose_command(["down", "-v", "--remove-orphans"])
+            docker_mgr.run_compose_command(["down", "--volumes", "--remove-orphans"], use_earthly_compose=True)
         else:
-            docker_mgr.run_compose_command(["down", "--remove-orphans"])
+            docker_mgr.run_compose_command(["down", "--remove-orphans"], use_earthly_compose=True)
         progress.remove_task(task)
         
         # Clean Docker system
@@ -1086,8 +1219,8 @@ def update():
         
         # Rebuild images
         task = progress.add_task("🔨 Rebuilding images...", total=None)
-        docker_mgr = DockerManager()
-        result = docker_mgr.run_compose_command(["build", "--no-cache"])
+        docker_mgr = EarthlyManager()
+        result = docker_mgr.run_earthly_command(["+all", "--no-cache"])
         if result.returncode == 0:
             console.print("[green]✅ Images rebuilt[/green]")
         else:
@@ -1096,7 +1229,7 @@ def update():
         
         # Restart services
         task = progress.add_task("🚀 Restarting services...", total=None)
-        docker_mgr.run_compose_command(["up", "-d"])
+        docker_mgr.restart_services()
         progress.remove_task(task)
     
     console.print("[green]✅ Update completed![/green]")
