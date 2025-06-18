@@ -1,11 +1,10 @@
-# Multi-stage build for the agentic system
-FROM ubuntu:24.04 AS base
+# Multi-stage build for the agent system with Python 3.13
+FROM python:3.13-slim AS base
 
 # Set build arguments
 ARG BUILD_DATE
 ARG VERSION
 ARG VCS_REF
-ARG PYTHON_VERSION=3.13.5
 
 # Add metadata
 LABEL maintainer="algent-system" \
@@ -25,16 +24,6 @@ ENV PYTHONDONTWRITEBYTECODE=1
 RUN apt-get update && apt-get install -y \
     # Build essentials
     build-essential \
-    software-properties-common \
-    # Python build dependencies
-    libssl-dev \
-    libffi-dev \
-    libbz2-dev \
-    libreadline-dev \
-    libsqlite3-dev \
-    libncurses5-dev \
-    libncursesw5-dev \
-    liblzma-dev \
     # Network tools
     curl \
     wget \
@@ -46,37 +35,9 @@ RUN apt-get update && apt-get install -y \
     tzdata \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Python 3.13.5 from source
-WORKDIR /tmp
-RUN wget https://www.python.org/ftp/python/${PYTHON_VERSION}/Python-${PYTHON_VERSION}.tgz \
-    && tar xzf Python-${PYTHON_VERSION}.tgz \
-    && cd Python-${PYTHON_VERSION} \
-    && ./configure \
-        --enable-optimizations \
-        --enable-shared \
-        --with-lto \
-        --with-computed-gotos \
-        --with-system-ffi \
-    && make -j$(nproc) \
-    && make altinstall \
-    && ldconfig \
-    && cd / \
-    && rm -rf /tmp/Python-${PYTHON_VERSION}*
-
-# Create symlinks for python3 and pip3
-RUN ln -sf /usr/local/bin/python3.13 /usr/local/bin/python3 \
-    && ln -sf /usr/local/bin/python3.13 /usr/local/bin/python \
-    && ln -sf /usr/local/bin/pip3.13 /usr/local/bin/pip3 \
-    && ln -sf /usr/local/bin/pip3.13 /usr/local/bin/pip
-
-# Install uv for fast dependency management
-RUN curl -LsSf https://astral.sh/uv/install.sh | sh
-ENV PATH="/root/.cargo/bin:$PATH"
-
 # Verify installations
 RUN python3 --version && \
-    pip3 --version && \
-    uv --version
+    pip3 --version
 
 # Builder stage
 FROM base AS builder
@@ -87,12 +48,12 @@ WORKDIR /app
 COPY pyproject.toml .
 COPY requirements.txt .
 
-# Create virtual environment and install dependencies using uv
-RUN uv venv /opt/venv
+# Create virtual environment and install dependencies
+RUN python3 -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
-# Install dependencies using uv (much faster than pip)
-RUN uv pip install -r requirements.txt
+# Install dependencies
+RUN pip install --upgrade pip && pip install -r requirements.txt
 
 # Production stage
 FROM base AS production
@@ -107,69 +68,51 @@ ENV PATH="/opt/venv/bin:$PATH"
 # Set working directory
 WORKDIR /app
 
-# Copy essential application code
+# Copy application code
 COPY --chown=agentic:agentic src/ ./src/
 COPY --chown=agentic:agentic pyproject.toml .
 
-# Create necessary directories first
-RUN mkdir -p /app/logs /app/data /app/config /app/examples && \
-
-# Copy the entire build context to temp location
-RUN mkdir -p /tmp/build
+# Copy build context to temp for conditional copying
 COPY . /tmp/build/
 
-# Copy optional files using shell commands
-RUN if [ -d "/tmp/build/examples" ]; then \
-        cp -r /tmp/build/examples/* /app/examples/ 2>/dev/null || true; \
-    fi
-
-RUN if [ -d "/tmp/build/config" ]; then \
-        cp -r /tmp/build/config/* /app/config/ 2>/dev/null || true; \
-    fi
-
-RUN if [ -f "/tmp/build/api_server.py" ]; then \
-        cp /tmp/build/api_server.py /app/ && chown agentic:agentic /app/api_server.py; \
-    fi
-
-# Clean up
-RUN rm -rf /tmp/build
-
-# Copy optional directories and files (only if they exist)
+# Copy optional files if they exist (using shell commands)
+RUN if [ -d "/tmp/build/examples" ]; then cp -r /tmp/build/examples ./; fi && \
+    if [ -d "/tmp/build/config" ]; then cp -r /tmp/build/config ./; fi && \
+    if [ -f "/tmp/build/api_server.py" ]; then cp /tmp/build/api_server.py ./; fi && \
+    rm -rf /tmp/build
 
 # Create necessary directories
-RUN mkdir -p /app/logs /app/data /app/config /app/examples && \
+RUN mkdir -p /app/logs /app/data && \
+    chown -R agentic:agentic /app
 
-# Create entrypoint script using cat with EOF
-RUN cat > /app/start_runner.sh << 'SCRIPT'
-#!/bin/bash
-set -e
-
-echo "🚀 Starting Algent System Agent Runner"
-echo "🐍 Python version: $(python3 --version)"
-echo "📦 UV version: $(uv --version)"
-
-# Wait for dependencies
-echo "⏳ Waiting for Redis..."
-while ! nc -z redis 6379; do 
-    echo "Waiting for Redis..."
-    sleep 1
-done
-echo "✅ Redis is ready"
-
-# Check what's available and start accordingly
-if [ "$RUN_DEMO_AGENTS" = "true" ] && [ -f "examples/simple_agent.py" ]; then
-    echo "🤖 Starting demo agents..."
-    exec python3 examples/simple_agent.py --mode demo
-elif [ -f "src/cli.py" ]; then
-    echo "🎮 CLI available - starting in standby mode"
-    echo "Use 'algent' commands to interact with the system"
-    while true; do sleep 60; done
-else
-    echo "💤 Agent runner in standby mode"
-    echo "Container is ready for manual interaction"
-    while true; do sleep 60; done
-fi
-SCRIPT
+# Create entrypoint script
+RUN echo '#!/bin/bash\n\
+set -e\n\
+\n\
+echo "🚀 Starting Algent System Agent Runner"\n\
+echo "🐍 Python version: $(python3 --version)"\n\
+\n\
+# Wait for dependencies\n\
+echo "⏳ Waiting for Redis..."\n\
+while ! nc -z redis 6379; do \n\
+    echo "Waiting for Redis..."\n\
+    sleep 1\n\
+done\n\
+echo "✅ Redis is ready"\n\
+\n\
+# Check what'\''s available and start accordingly\n\
+if [ "$RUN_DEMO_AGENTS" = "true" ] && [ -f "examples/simple_agent.py" ]; then\n\
+    echo "🤖 Starting demo agents..."\n\
+    exec python3 examples/simple_agent.py --mode demo\n\
+elif [ -f "src/cli.py" ]; then\n\
+    echo "🎮 CLI available - starting in standby mode"\n\
+    echo "Use '\''algent'\'' commands to interact with the system"\n\
+    while true; do sleep 60; done\n\
+else\n\
+    echo "💤 Agent runner in standby mode"\n\
+    echo "Container is ready for manual interaction"\n\
+    while true; do sleep 60; done\n\
+fi' > /app/start_runner.sh
 
 RUN chmod +x /app/start_runner.sh && chown agentic:agentic /app/start_runner.sh
 
@@ -190,3 +133,4 @@ EXPOSE 8000
 
 # Start the runner
 CMD ["/app/start_runner.sh"]
+

@@ -1,7 +1,7 @@
 """Core Agent Implementation"""
-
 import asyncio
 import logging
+import os
 from abc import ABC, abstractmethod
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Set
@@ -63,7 +63,20 @@ class Agent(ABC):
     async def initialize(self) -> None:
         """Initialize the agent and its clients"""
         try:
-            self.a2a_client = A2AClient(agent_id=self.agent_id, security_context=self.security_context)
+            # Get Redis URL from environment, with password if set
+            redis_url = os.getenv("REDIS_URL", "redis://localhost:6379")
+            redis_password = os.getenv("REDIS_PASSWORD")
+            
+            # If password is set, include it in the URL
+            if redis_password and "redis://" in redis_url and "@" not in redis_url:
+                # Convert redis://host:port to redis://:password@host:port
+                redis_url = redis_url.replace("redis://", f"redis://:{redis_password}@")
+            
+            self.a2a_client = A2AClient(
+                agent_id=self.agent_id, 
+                security_context=self.security_context,
+                redis_url=redis_url
+            )
             await self.a2a_client.initialize()
 
             self.mcp_client = MCPClient(agent_id=self.agent_id, config=self.config.get("mcp", {}))

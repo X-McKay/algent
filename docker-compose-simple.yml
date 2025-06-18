@@ -39,15 +39,19 @@ services:
       - algent-network
 
   api-server:
-    image: algent-api:earthly
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: algent:latest
     container_name: algent-api-server
     environment:
-      - REDIS_URL=${REDIS_URL:-redis://redis:6379}
+      - REDIS_URL=redis://:${REDIS_PASSWORD:-redispass}@redis:6379
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-redispass}
       - POSTGRES_DB=${POSTGRES_DB:-algent}
       - POSTGRES_USER=${POSTGRES_USER:-algent}
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-postgrespass}
-      - API_HOST=${API_HOST:-localhost}
-      - API_PORT=${API_PORT:-8000}
+      - API_HOST=0.0.0.0
+      - API_PORT=8000
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - START_API_SERVER=true
     ports:
@@ -60,51 +64,7 @@ services:
     restart: unless-stopped
     networks:
       - algent-network
-
-  file-processor:
-    image: algent-file-processor:earthly
-    container_name: algent-file-processor
-    environment:
-      - REDIS_URL=${REDIS_URL:-redis://redis:6379}
-      - POSTGRES_DB=${POSTGRES_DB:-algent}
-      - POSTGRES_USER=${POSTGRES_USER:-algent}
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-postgrespass}
-      - LOG_LEVEL=${LOG_LEVEL:-INFO}
-      - AGENT_TYPE=file_processor
-      - AGENT_ID=file-processor-1
-    depends_on:
-      redis:
-        condition: service_healthy
-      postgres:
-        condition: service_healthy
-      api-server:
-        condition: service_started
-    restart: unless-stopped
-    networks:
-      - algent-network
-
-  agent-runner:
-    image: algent:earthly
-    container_name: algent-agent-runner
-    environment:
-      - REDIS_URL=${REDIS_URL:-redis://redis:6379}
-      - POSTGRES_DB=${POSTGRES_DB:-algent}
-      - POSTGRES_USER=${POSTGRES_USER:-algent}
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-postgrespass}
-      - LOG_LEVEL=${LOG_LEVEL:-INFO}
-      - RUN_DEMO_AGENTS=${RUN_DEMO_AGENTS:-false}
-      - AGENT_HEARTBEAT_INTERVAL=${AGENT_HEARTBEAT_INTERVAL:-30}
-      - AGENT_TASK_TIMEOUT=${AGENT_TASK_TIMEOUT:-300}
-    depends_on:
-      redis:
-        condition: service_healthy
-      postgres:
-        condition: service_healthy
-      api-server:
-        condition: service_started
-    restart: unless-stopped
-    networks:
-      - algent-network
+    command: ["python3", "api_server.py"]
 
 volumes:
   algent_redis_data:
@@ -113,3 +73,4 @@ volumes:
 networks:
   algent-network:
     driver: bridge
+

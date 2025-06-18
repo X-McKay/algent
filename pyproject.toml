@@ -12,7 +12,6 @@ keywords = ["ai", "agents", "a2a", "mcp", "microservices", "cli"]
 
 dependencies = [
     # Core dependencies - Python 3.13 compatible versions
-    "asyncio",
     "aiohttp>=3.9.0",
     "redis>=5.0.0",  # Python 3.13 compatible (instead of aioredis)
     "fastapi>=0.104.0",
